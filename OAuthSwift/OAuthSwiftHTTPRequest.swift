@@ -106,93 +106,95 @@ public class OAuthSwiftHTTPRequest: NSObject, NSURLSessionDelegate, OAuthSwiftRe
     }
     
     func start() {
-        guard request == nil else { return } // Don't start the same request twice!
+      guard request == nil else { return } // Don't start the same request twice!
+      let successHandler = self.successHandler
+      let failureHandler = self.failureHandler
+      
+      do {
+        self.request = try self.makeRequest()
+      } catch let error as NSError {
+        failureHandler?(error: NSError(domain: OAuthSwiftErrorDomain, code: OAuthSwiftErrorCode.RequestCreationError.rawValue, userInfo: [
+          NSLocalizedDescriptionKey: error.localizedDescription,
+          NSUnderlyingErrorKey: error
+          ])
+        )
+        self.request = nil
+        return
+      }
+      
+      OAuthSwiftHTTPRequest.executionContext {
+        // perform lock here to prevent cancel calls on another thread while creating the request
+        objc_sync_enter(self)
+        defer { objc_sync_exit(self) }
+        if self.cancelRequested {
+          return
+        }
         
-        do {
-            self.request = try self.makeRequest()
-        } catch let error as NSError {
-            failureHandler?(error: NSError(domain: OAuthSwiftErrorDomain, code: OAuthSwiftErrorCode.RequestCreationError.rawValue, userInfo: [
-                NSLocalizedDescriptionKey: error.localizedDescription,
-                NSUnderlyingErrorKey: error
-                ])
-            )
-            self.request = nil
-            return
-        }
-
-        OAuthSwiftHTTPRequest.executionContext {
-            // perform lock here to prevent cancel calls on another thread while creating the request
-            objc_sync_enter(self)
-            defer { objc_sync_exit(self) }
-            if self.cancelRequested {
-                return
-            }
-
-            self.session = NSURLSession(configuration: NSURLSessionConfiguration.defaultSessionConfiguration(),
-                delegate: self,
-                delegateQueue: NSOperationQueue.mainQueue())
-            self.task = self.session.dataTaskWithRequest(self.request!) { [unowned self] data, response, error -> Void in
-                #if os(iOS)
-                    #if !OAUTH_APP_EXTENSIONS
-                        UIApplication.sharedApplication().networkActivityIndicatorVisible = false
-                    #endif
-                #endif
-                
-                guard error == nil else {
-                    self.failureHandler?(error: error!)
-                    return
-                }
-
-                guard let response = response as? NSHTTPURLResponse, responseData = data else {
-                    let badRequestCode = 400
-                    let localizedDescription = OAuthSwiftHTTPRequest.descriptionForHTTPStatus(badRequestCode, responseString: "")
-                    let userInfo : [NSObject : AnyObject] = [NSLocalizedDescriptionKey: localizedDescription]
-                    let error = NSError(domain: NSURLErrorDomain, code: badRequestCode, userInfo: userInfo)
-                    self.failureHandler?(error: error)
-                    return
-                }
-
-                guard response.statusCode < 400 else {
-                    var errorCode = response.statusCode
-                    var localizedDescription = String()
-                    let responseString = String(data: responseData, encoding: self.config.dataEncoding)
-   
-                    if let responseJSON = try? NSJSONSerialization.JSONObjectWithData(responseData, options: NSJSONReadingOptions.MutableContainers) {
-                        if let code = responseJSON["error"] as? String, description = responseJSON["error_description"] as? String {
-                            localizedDescription = NSLocalizedString("\(code) \(description)", comment: "")
-                            if code == "authorization_pending" {
-                                errorCode = OAuthSwiftErrorCode.AuthorizationPending.rawValue
-                            }
-                        }
-                    } else {
-                        localizedDescription = OAuthSwiftHTTPRequest.descriptionForHTTPStatus(response.statusCode, responseString: String(data: responseData, encoding: self.config.dataEncoding)!)
-                    }
- 
-                    let userInfo = [
-                        NSLocalizedDescriptionKey: localizedDescription,
-                        "Response-Headers": response.allHeaderFields,
-                        "Response-Body": responseString ?? NSNull(),
-                        NSURLErrorFailingURLErrorKey: response.URL?.absoluteString ?? NSNull(),
-                        OAuthSwiftErrorResponseKey: response ?? NSNull(),
-                        OAuthSwiftErrorResponseDataKey: responseData
-                    ]
-                    
-                    let error = NSError(domain: NSURLErrorDomain, code: errorCode, userInfo: userInfo)
-                    self.failureHandler?(error: error)
-                    return
-                }
-                
-                self.successHandler?(data: responseData, response: response)
-            }
-            self.task?.resume()
-            self.session.finishTasksAndInvalidate()
-
-            #if os(iOS)
-                #if !OAUTH_APP_EXTENSIONS
-                    UIApplication.sharedApplication().networkActivityIndicatorVisible = true
-                #endif
+        self.session = NSURLSession(configuration: NSURLSessionConfiguration.defaultSessionConfiguration(),
+          delegate: self,
+          delegateQueue: NSOperationQueue.mainQueue())
+        self.task = self.session.dataTaskWithRequest(self.request!) { (data, response, error) in
+          
+          #if os(iOS)
+            #if !OAUTH_APP_EXTENSIONS
+              UIApplication.sharedApplication().networkActivityIndicatorVisible = false
             #endif
+          #endif
+          guard error == nil else {
+            failureHandler?(error: error!)
+            return
+          }
+          
+          guard let response = response as? NSHTTPURLResponse, let responseData = data else {
+            let badRequestCode = 400
+            let localizedDescription = OAuthSwiftHTTPRequest.descriptionForHTTPStatus(badRequestCode, responseString: "")
+            let userInfo : [NSObject : AnyObject] = [NSLocalizedDescriptionKey: localizedDescription]
+            let error = NSError(domain: NSURLErrorDomain, code: badRequestCode, userInfo: userInfo)
+            failureHandler?(error:error)
+            return
+          }
+          
+          guard response.statusCode < 400 else {
+            var errorCode = response.statusCode
+            var localizedDescription = String()
+            let responseString = String(data: responseData, encoding: OAuthSwiftDataEncoding)
+            
+            if let responseJSON = try? NSJSONSerialization.JSONObjectWithData(responseData, options: NSJSONReadingOptions.MutableContainers) {
+              if let code = responseJSON["error"] as? String, description = responseJSON["error_description"] as? String {
+                localizedDescription = NSLocalizedString("\(code) \(description)", comment: "")
+                if code == "authorization_pending" {
+                  errorCode = OAuthSwiftErrorCode.AuthorizationPending.rawValue
+                }
+              }
+            } else {
+              localizedDescription = OAuthSwiftHTTPRequest.descriptionForHTTPStatus(response.statusCode, responseString: String(data: responseData, encoding: OAuthSwiftDataEncoding)!)
+            }
+            
+            let userInfo = [
+              NSLocalizedDescriptionKey: localizedDescription,
+              "Response-Headers": response.allHeaderFields,
+              "Response-Body": responseString ?? NSNull(),
+              NSURLErrorFailingURLErrorKey: response.URL?.absoluteString ?? NSNull(),
+              OAuthSwiftErrorResponseKey: response ?? NSNull(),
+              OAuthSwiftErrorResponseDataKey: responseData
+            ]
+            
+            let error = NSError(domain: NSURLErrorDomain, code: errorCode, userInfo: userInfo)
+            failureHandler?(error: error)
+            return
+          }
+          
+          successHandler?(data: responseData, response: response)
         }
+        self.task?.resume()
+        self.session.finishTasksAndInvalidate()
+        
+        #if os(iOS)
+          #if !OAUTH_APP_EXTENSIONS
+            UIApplication.sharedApplication().networkActivityIndicatorVisible = true
+          #endif
+        #endif
+      }
     }
 
     public func cancel() {
